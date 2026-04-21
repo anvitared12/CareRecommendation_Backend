@@ -1,80 +1,73 @@
 from pathlib import Path
-
-from fastapi import FastAPI
-from keras.models import load_model
-
-from PIL import Image
-import numpy as np
-
-from fastapi import File, UploadFile, HTTPException
-from sklearn import preprocessing
 import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+app = FastAPI(
+    title="Plant Care Recommendation API",
+    version="1.0.0",
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
-CARE_DATASET_PATH = PROJECT_ROOT  / "PlantCareDataset.xlsx"
-PLANT_MODEL_PATH = PROJECT_ROOT / "Models" / "plant_efficientnet_model.keras"
-DISEASE_MODEL_PATH = PROJECT_ROOT / "Models" / "plantdisease_efficientnet_model.keras"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-try:
-    care_df = pd.read_excel(CARE_DATASET_PATH)
-    care_dict = {}
-    for _, row in care_df.iterrows():
-        plant_name = str(row['Plant Name']).lower().strip()
-        care_dict[plant_name] = {
-            "Growth": row.get("Growth", ""),
-            "Soil": row.get("Soil", ""),
-            "Sunlight": row.get("Sunlight", ""),
-            "Watering": row.get("Watering", ""),
-            "Fertilization Type": row.get("Fertilization Type", "")
-        }
-except Exception as e:
-    print(f"Error loading Care recommendation dataset: {e}")
-    care_dict = {}
+# ─── Paths ─────────────────────────────────────────
+BASE_DIR      = Path(__file__).resolve().parent
+DATASET_PATH  = BASE_DIR / "PlantCareDataset.xlsx"
 
-plant_identification_model = load_model(str(PLANT_MODEL_PATH))
-disease_identification_model = load_model(str(DISEASE_MODEL_PATH))
+# ─── Load Data ─────────────────────────────────────
+def load_care_data():
+    if not DATASET_PATH.exists():
+        raise FileNotFoundError(f"Dataset not found: {DATASET_PATH}")
 
-def processing_image(image, size=(244,244)):
-    image = image.resize(size)
-    image = np.array(image) / 255.0
-    image = np.expand_dims(image, axis=0)
-    return image
+    df = pd.read_excel(DATASET_PATH).fillna("")
+    df.columns = [str(c).strip() for c in df.columns]
+    records = df.to_dict(orient="records")
+    indexed = {
+        str(r.get("Plant Name", "")).lower().strip(): r
+        for r in records
+        if str(r.get("Plant Name", "")).strip()
+    }
+    return records, indexed
 
+records, care_dict = load_care_data()
 
-plant_labels = []
-disease_labels = []
-
-@app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-
-    image = Image.open(file.file).convert("RGB")
-    img = processing_image(image)
-
-    # PLANT DETECTION
-    plant_pred = plant_identification_model.predict(img)
-    plant_idx = int(np.argmax(plant_pred))
-    plant_name = plant_labels[plant_idx]
-
-    # DISEASE DETECTION
-    disease_pred = disease_identification_model.predict(img)
-    disease_idx = int(np.argmax(disease_pred))
-    disease_name = disease_labels[disease_idx]
-
+# ─── Routes ────────────────────────────────────────
+@app.get("/")
+def root():
     return {
-        "plant":plant_name,
-        "plant_confidence": float(np.max(plant_pred)),
-        "disease":disease_name,
-        "disease_confidence":float(np.max(disease_pred))
+        "status": "running",
+        "total_plants": len(records),
+        "columns": list(records[0].keys()) if records else [],
     }
 
-
 @app.get("/care-recommendation")
-async def get_care_recommendation(plant: str):
-    plant_key = plant.lower().strip()
-    if plant_key in care_dict:
-        return {"plant": plant, "recommendation": care_dict[plant_key]}
-    else:
-        raise HTTPException(status_code=404, detail="Plant not found in the dataset")
+def get_care_recommendation(
+    plant: str = Query(..., min_length=1, description="Plant name to search")
+):
+    key = plant.lower().strip()
+
+    # Exact match
+    if key in care_dict:
+        return {"status": "found", "count": 1, "data": [care_dict[key]]}
+
+    # Partial match
+    matches = [
+        r for r in records
+        if key in str(r.get("Plant Name", "")).lower()
+    ]
+    if matches:
+        return {"status": "partial_match", "count": len(matches), "data": matches}
+
+    raise HTTPException(status_code=404, detail=f"No data found for '{plant}'")
+
+@app.get("/plants")
+def list_plants():
+    return {
+        "total": len(records),
+        "plants": [r.get("Plant Name", "") for r in records if r.get("Plant Name")],
+    }
